@@ -6,7 +6,9 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 const app = express();
 const PORT = 8000;
 app.use(express.json());
-app.use(cors());
+app.use(
+  cors(),
+);
 
 const client = new MongoClient(process.env.MONGODB_URL);
 
@@ -24,7 +26,10 @@ const connectClient = await connectToMongoDB();
 const db = connectClient.db("StudioSpace");
 const studiosCollection = db.collection("Studios");
 const bookingsCollection = db.collection("Bookings");
-
+const getUserEmail = (req) =>
+  String(req.user?.email || "")
+    .trim()
+    .toLowerCase();
 const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -45,7 +50,7 @@ const verifyToken = async (req, res, next) => {
     req.user = payload;
     next();
   } catch (error) {
-    return res.status(500).send({ msg: "Server Error!" });
+    return res.status(401).send({ msg: "Unauthorized!" });
   }
 };
 
@@ -53,7 +58,7 @@ app.get("/", (req, res) => {
   res.send({ msg: "Hi from server" });
 });
 
-app.post("/studios", verifyToken,async (req, res) => {
+app.post("/studios", verifyToken, async (req, res) => {
   const studioData = req.body;
   const result = await studiosCollection.insertOne(studioData);
   res.send(result);
@@ -73,7 +78,7 @@ app.get("/my-listings/:email", verifyToken, async (req, res) => {
   const result = await studiosCollection
     .find(
       { $or: [{ ownerEmail: email }, { hostEmail: email }] },
-      { collation: { locale: "en", strength: 2 } }, 
+      { collation: { locale: "en", strength: 2 } },
     )
     .toArray();
 
@@ -91,7 +96,7 @@ app.get("/studios/:id", async (req, res) => {
   res.send(result);
 });
 
-app.patch("/studios/:id",verifyToken, async (req, res) => {
+app.patch("/studios/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
   const data = req.body;
   const result = await studiosCollection.updateOne(
@@ -101,33 +106,93 @@ app.patch("/studios/:id",verifyToken, async (req, res) => {
   res.json(result);
 });
 
-app.delete("/studios/:id", async (req, res) => {
+app.delete("/studios/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
   const result = await studiosCollection.deleteOne({ _id: new ObjectId(id) });
   res.json(result);
 });
 
-app.post("/my-bookings", async (req, res) => {
-  const { studioId, userEmail, userName, date, start, end, hours, total } =
-    req.body;
-  const booking = {
-    studioId,
-    userEmail: userEmail.toLowerCase(),
-    userName,
-    date,
-    start,
-    end,
-    hours,
-    total,
-    status: "pending",
-    createdAt: new Date(),
-  };
-  const result = await bookingsCollection.insertOne(booking);
-  res.send(result);
+app.post("/my-bookings", verifyToken, async (req, res) => {
+  try {
+    const { studioId, userName, date, start, end, total } = req.body;
+
+    const userEmail = req.user?.email?.toLowerCase();
+
+    const alreadyBooked = await bookingsCollection.findOne({
+      studioId: String(studioId),
+      date,
+      status: { $in: ["pending", "confirmed"] },
+      start: { $lt: end },
+      end: { $gt: start },
+    });
+
+    if (alreadyBooked) {
+      return res.status(409).send({
+        message: "This studio is already booked for this time!",
+      });
+    }
+    if (!userEmail) {
+      return res.status(401).send({ message: "Unauthorized!" });
+    }
+
+  
+    if (!studioId || !date || !start || !end) {
+      return res.status(400).send({
+        message: "Please provide all booking details.",
+      });
+    }
+
+  
+    const timeFormat = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+    if (!timeFormat.test(start) || !timeFormat.test(end)) {
+      return res.status(400).send({
+        message: "Invalid time format.",
+      });
+    }
+
+   
+    if (toMinutes(end) <= toMinutes(start)) {
+      return res.status(400).send({
+        message: "End time must be after start time.",
+      });
+    }
+
+   
+  
+    const booking = {
+      studioId,
+      userEmail,
+      userName,
+      date,
+      start,
+      end,
+      hours: (toMinutes(end) - toMinutes(start)) / 60,
+      total,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    const result = await bookingsCollection.insertOne(booking);
+
+    res.status(201).send({
+      success: true,
+      insertedId: result.insertedId,
+      message: "Booking successful!",
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send({
+      message: "Something went wrong!",
+    });
+  }
 });
 
-app.get("/my-bookings/:email", async (req, res) => {
-  const email = req.params.email.toLowerCase();
+app.get("/my-bookings/:email", verifyToken, async (req, res) => {
+  const email = String(req.params.email || "").toLowerCase();
+  const tokenEmail = String(req.user?.email || "").toLowerCase();
+
   const result = await bookingsCollection
     .find({ userEmail: email })
     .sort({ createdAt: -1 })
@@ -135,18 +200,36 @@ app.get("/my-bookings/:email", async (req, res) => {
   res.send(result);
 });
 
-app.delete("/my-bookings/:id", async (req, res) => {
-  const { id } = req.params;
-  const result = await bookingsCollection.deleteOne({
-    _id: new ObjectId(id),
-    status: { $in: ["pending", "declined"] },
-  });
-  if (result.deletedCount === 0) {
-    return res
-      .status(404)
-      .send({ message: "Booking not found or can't be deleted." });
+app.delete("/my-bookings/:id", verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userEmail = getUserEmail(req);
+
+    if (!userEmail) {
+      return res.status(401).send({ message: "Unauthorized!" });
+    }
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid booking ID." });
+    }
+
+    const result = await bookingsCollection.deleteOne({
+      _id: new ObjectId(id),
+      userEmail,
+      status: { $in: ["pending", "declined"] },
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        message: "Booking not found or can't be deleted.",
+      });
+    }
+
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to delete booking." });
   }
-  res.send({ success: true });
 });
 
 function toMinutes(time) {
@@ -154,7 +237,7 @@ function toMinutes(time) {
   return hours * 60 + minutes;
 }
 
-app.patch("/my-bookings/:id", async (req, res) => {
+app.patch("/my-bookings/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { date, start, end } = req.body || {};

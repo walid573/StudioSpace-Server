@@ -86,8 +86,21 @@ app.get("/my-listings/:email", verifyToken, async (req, res) => {
 });
 
 app.get("/featured", async (req, res) => {
-  const result = await studiosCollection.find().toArray();
-  res.send(result);
+  try {
+    const result = await studiosCollection
+      .find({ status: "approved" })
+      .sort({ rating: -1, createdAt: -1 })
+      .limit(6)
+      .toArray();
+
+    res.status(200).send(result);
+  } catch (error) {
+    console.error("Failed to fetch featured studios:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch featured studios",
+    });
+  }
 });
 
 app.get("/studios/:id", async (req, res) => {
@@ -189,16 +202,44 @@ app.post("/my-bookings", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/my-bookings/:email", verifyToken, async (req, res) => {
-  const email = String(req.params.email || "").toLowerCase();
-  const tokenEmail = String(req.user?.email || "").toLowerCase();
 
-  const result = await bookingsCollection
-    .find({ userEmail: email })
-    .sort({ createdAt: -1 })
-    .toArray();
-  res.send(result);
+app.get("/my-bookings/:email", verifyToken, async (req, res) => {
+    try {
+        const email = String(req.params.email || "").toLowerCase();
+        const tokenEmail = String(req.user?.email || "").toLowerCase();
+
+        
+        if (!tokenEmail) {
+            return res.status(401).send({
+                message: "Unauthorized access",
+            });
+        }
+
+      
+        if (email !== tokenEmail) {
+            return res.status(403).send({
+                message: "You can only access your own bookings",
+            });
+        }
+
+        const result = await bookingsCollection
+            .find({
+                userEmail: tokenEmail,
+            })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        res.status(200).send(result);
+
+    } catch (error) {
+        console.error("My bookings error:", error);
+
+        res.status(500).send({
+            message: "Failed to fetch bookings",
+        });
+    }
 });
+
 
 app.delete("/my-bookings/:id", verifyToken, async (req, res) => {
   try {

@@ -2,6 +2,7 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 const app = express();
 const PORT = 8000;
 app.use(express.json());
@@ -18,16 +19,41 @@ export async function connectToMongoDB() {
     console.dir(err);
   }
 }
+
 const connectClient = await connectToMongoDB();
 const db = connectClient.db("StudioSpace");
 const studiosCollection = db.collection("Studios");
 const bookingsCollection = db.collection("Bookings");
 
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).send({ msg: "Unauthorized!" });
+  }
+  const token = authHeader.split(" ")[1];
+  if (!token) {
+    return res.status(401).send({ msg: "Unauthorized!" });
+  }
+
+  const JWKS = createRemoteJWKSet(
+    new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+  );
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    req.user = payload;
+    next();
+  } catch (error) {
+    return res.status(500).send({ msg: "Server Error!" });
+  }
+};
+
 app.get("/", (req, res) => {
   res.send({ msg: "Hi from server" });
 });
 
-app.post("/studios", async (req, res) => {
+app.post("/studios", verifyToken,async (req, res) => {
   const studioData = req.body;
   const result = await studiosCollection.insertOne(studioData);
   res.send(result);
@@ -35,6 +61,22 @@ app.post("/studios", async (req, res) => {
 
 app.get("/studios", async (req, res) => {
   const result = await studiosCollection.find().toArray();
+  res.send(result);
+});
+app.get("/my-listings/:email", verifyToken, async (req, res) => {
+  const email = req.params.email.toLowerCase();
+
+  if (email !== String(req.user?.email || "").toLowerCase()) {
+    return res.status(403).send({ msg: "Forbidden!" });
+  }
+
+  const result = await studiosCollection
+    .find(
+      { $or: [{ ownerEmail: email }, { hostEmail: email }] },
+      { collation: { locale: "en", strength: 2 } }, 
+    )
+    .toArray();
+
   res.send(result);
 });
 
@@ -49,7 +91,7 @@ app.get("/studios/:id", async (req, res) => {
   res.send(result);
 });
 
-app.patch("/studios/:id", async (req, res) => {
+app.patch("/studios/:id",verifyToken, async (req, res) => {
   const { id } = req.params;
   const data = req.body;
   const result = await studiosCollection.updateOne(
@@ -122,7 +164,8 @@ app.patch("/my-bookings/:id", async (req, res) => {
     }
 
     const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
-    if (!booking) return res.status(404).send({ message: "Booking not found." });
+    if (!booking)
+      return res.status(404).send({ message: "Booking not found." });
 
     if (booking.status !== "pending") {
       return res
@@ -132,10 +175,11 @@ app.patch("/my-bookings/:id", async (req, res) => {
 
     const hours = (toMinutes(end) - toMinutes(start)) / 60;
     if (!(hours > 0)) {
-      return res.status(400).send({ message: "End time must be after start time." });
+      return res
+        .status(400)
+        .send({ message: "End time must be after start time." });
     }
 
-    
     const rate = booking.hours > 0 ? booking.total / booking.hours : 0;
     const total = Math.round(rate * hours * 100) / 100;
 
@@ -151,7 +195,6 @@ app.patch("/my-bookings/:id", async (req, res) => {
     res.status(500).send({ message: error.message || "Server error." });
   }
 });
-
 
 app.listen(PORT, () => {
   console.log(`Server is running at ${PORT}`);

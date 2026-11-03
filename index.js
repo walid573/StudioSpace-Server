@@ -7,7 +7,10 @@ const app = express();
 const PORT = 8000;
 app.use(express.json());
 app.use(
-  cors(),
+  cors({
+    origin: true,
+    credentials: true,
+  }),
 );
 
 const client = new MongoClient(process.env.MONGODB_URL);

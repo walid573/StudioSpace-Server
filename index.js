@@ -62,9 +62,42 @@ app.get("/", (req, res) => {
 });
 
 app.post("/studios", verifyToken, async (req, res) => {
-  const studioData = req.body;
-  const result = await studiosCollection.insertOne(studioData);
-  res.send(result);
+  try {
+    const {
+      title,
+      category,
+      hourlyRate,
+      securityDeposit,
+      maxCapacity,
+      location,
+      imageUrl,
+      amenities,
+      description,
+    } = req.body;
+
+    const studioData = {
+      title,
+      category,
+      hourlyRate: parseFloat(hourlyRate),
+      securityDeposit: parseFloat(securityDeposit),
+      maxCapacity: parseInt(maxCapacity),
+      location,
+      imageUrl,
+      amenities,
+      description,
+      ownerEmail: req.user?.email?.toLowerCase(),
+      ownerName: req.user?.name || "Unknown Host",
+      status: "pending",
+      rating: 0,
+      createdAt: new Date(),
+    };
+
+    const result = await studiosCollection.insertOne(studioData);
+    res.status(201).send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to create studio" });
+  }
 });
 
 app.get("/studios", async (req, res) => {
@@ -113,26 +146,66 @@ app.get("/studios/:id", async (req, res) => {
 });
 
 app.patch("/studios/:id", verifyToken, async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
-  const result = await studiosCollection.updateOne(
-    { _id: new ObjectId(id) },
-    { $set: data },
-  );
-  res.json(result);
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid studio ID." });
+
+    const update = {};
+    for (const key of ALLOWED_UPDATE) if (req.body[key] !== undefined) update[key] = req.body[key];
+    if (update.hourlyRate !== undefined) update.hourlyRate = Number(update.hourlyRate);
+    if (update.securityDeposit !== undefined) update.securityDeposit = Number(update.securityDeposit);
+    if (update.maxCapacity !== undefined) update.maxCapacity = parseInt(update.maxCapacity);
+    update.updatedAt = new Date();
+
+    const result = await studiosCollection.updateOne(
+      { _id: new ObjectId(id), ownerEmail: getUserEmail(req) },
+      { $set: update },
+    );
+    if (result.matchedCount === 0)
+      return res.status(404).send({ message: "Studio not found or not yours." });
+    res.json(result);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send({ message: "Failed to update studio." });
+  }
 });
 
 app.delete("/studios/:id", verifyToken, async (req, res) => {
-  const { id } = req.params;
-  const result = await studiosCollection.deleteOne({ _id: new ObjectId(id) });
-  res.json(result);
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid studio ID." });
+    const result = await studiosCollection.deleteOne({
+      _id: new ObjectId(id),
+      ownerEmail: getUserEmail(req),
+    });
+    if (result.deletedCount === 0)
+      return res.status(404).send({ message: "Studio not found or not yours." });
+    res.json(result);
+  } catch (e) {
+    res.status(500).send({ message: "Failed to delete studio." });
+  }
 });
+
 
 app.post("/my-bookings", verifyToken, async (req, res) => {
   try {
-    const { studioId, userName, date, start, end, total } = req.body;
+    const { studioId, userName, date, start, end } = req.body;
+    const userEmail = getUserEmail(req);
 
-    const userEmail = req.user?.email?.toLowerCase();
+    if (!userEmail) return res.status(401).send({ message: "Unauthorized!" });
+    if (!ObjectId.isValid(studioId) || !date || !start || !end)
+      return res.status(400).send({ message: "Please provide all booking details." });
+
+    const timeFormat = /^([01]\d|2[0-3]):[0-5]\d$/;
+    if (!timeFormat.test(start) || !timeFormat.test(end))
+      return res.status(400).send({ message: "Invalid time format." });
+    if (toMinutes(end) <= toMinutes(start))
+      return res.status(400).send({ message: "End time must be after start time." });
+
+    const studio = await studiosCollection.findOne({ _id: new ObjectId(studioId) });
+    if (!studio) return res.status(404).send({ message: "Studio not found." });
+    if (studio.ownerEmail === userEmail)
+      return res.status(400).send({ message: "You can't book your own studio." });
 
     const alreadyBooked = await bookingsCollection.findOne({
       studioId: String(studioId),
@@ -141,108 +214,76 @@ app.post("/my-bookings", verifyToken, async (req, res) => {
       start: { $lt: end },
       end: { $gt: start },
     });
+    if (alreadyBooked)
+      return res.status(409).send({ message: "This studio is already booked for this time!" });
 
-    if (alreadyBooked) {
-      return res.status(409).send({
-        message: "This studio is already booked for this time!",
-      });
-    }
-    if (!userEmail) {
-      return res.status(401).send({ message: "Unauthorized!" });
-    }
-
-  
-    if (!studioId || !date || !start || !end) {
-      return res.status(400).send({
-        message: "Please provide all booking details.",
-      });
-    }
-
-  
-    const timeFormat = /^([01]\d|2[0-3]):[0-5]\d$/;
-
-    if (!timeFormat.test(start) || !timeFormat.test(end)) {
-      return res.status(400).send({
-        message: "Invalid time format.",
-      });
-    }
-
-   
-    if (toMinutes(end) <= toMinutes(start)) {
-      return res.status(400).send({
-        message: "End time must be after start time.",
-      });
-    }
-
-   
-  
+    const hours = (toMinutes(end) - toMinutes(start)) / 60;
     const booking = {
-      studioId,
+      studioId: String(studioId),
+      studioTitle: studio.title,      // saves extra fetches on My Bookings
+      studioImage: studio.imageUrl,
+      hostEmail: studio.ownerEmail,
       userEmail,
       userName,
-      date,
-      start,
-      end,
-      hours: (toMinutes(end) - toMinutes(start)) / 60,
-      total,
+      date, start, end, hours,
+      total: Math.round(studio.hourlyRate * hours * 100) / 100,
       status: "pending",
       createdAt: new Date(),
     };
-
     const result = await bookingsCollection.insertOne(booking);
-
-    res.status(201).send({
-      success: true,
-      insertedId: result.insertedId,
-      message: "Booking successful!",
-    });
+    res.status(201).send({ success: true, insertedId: result.insertedId, message: "Booking successful!" });
   } catch (error) {
     console.error(error);
+    res.status(500).send({ message: "Something went wrong!" });
+  }
+});
+
+app.get("/my-bookings/:email", verifyToken, async (req, res) => {
+  try {
+    const email = String(req.params.email || "").toLowerCase();
+    const tokenEmail = String(req.user?.email || "").toLowerCase();
+
+    if (!tokenEmail) {
+      return res.status(401).send({
+        message: "Unauthorized access",
+      });
+    }
+
+    if (email !== tokenEmail) {
+      return res.status(403).send({
+        message: "You can only access your own bookings",
+      });
+    }
+
+    const result = await bookingsCollection
+      .find({
+        userEmail: tokenEmail,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(result);
+  } catch (error) {
+    console.error("My bookings error:", error);
 
     res.status(500).send({
-      message: "Something went wrong!",
+      message: "Failed to fetch bookings",
     });
   }
 });
 
-
-app.get("/my-bookings/:email", verifyToken, async (req, res) => {
-    try {
-        const email = String(req.params.email || "").toLowerCase();
-        const tokenEmail = String(req.user?.email || "").toLowerCase();
-
-        
-        if (!tokenEmail) {
-            return res.status(401).send({
-                message: "Unauthorized access",
-            });
-        }
-
-      
-        if (email !== tokenEmail) {
-            return res.status(403).send({
-                message: "You can only access your own bookings",
-            });
-        }
-
-        const result = await bookingsCollection
-            .find({
-                userEmail: tokenEmail,
-            })
-            .sort({ createdAt: -1 })
-            .toArray();
-
-        res.status(200).send(result);
-
-    } catch (error) {
-        console.error("My bookings error:", error);
-
-        res.status(500).send({
-            message: "Failed to fetch bookings",
-        });
-    }
-});
-
+const ALLOWED_UPDATE = [
+  "title",
+  "category",
+  "hourlyRate",
+  "securityDeposit",
+  "maxCapacity",
+  "location",
+  "imageUrl",
+  "images",
+  "amenities",
+  "description",
+];
 
 app.delete("/my-bookings/:id", verifyToken, async (req, res) => {
   try {
